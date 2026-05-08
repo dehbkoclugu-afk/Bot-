@@ -16,15 +16,17 @@ log = logging.getLogger(__name__)
 
 def _build_exchange() -> ccxt.Exchange:
     cls = getattr(ccxt, EXCHANGE)
-    params = {
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-    }
+    params = {"enableRateLimit": True}
+    if API_KEY:
+        params["apiKey"] = API_KEY
+        params["secret"] = API_SECRET
     ex = cls(params)
-    if TESTNET and hasattr(ex, "set_sandbox_mode"):
+    # Sandbox only if keys provided (sandbox requires auth)
+    if TESTNET and API_KEY and hasattr(ex, "set_sandbox_mode"):
         ex.set_sandbox_mode(True)
         log.info("Testnet (sandbox) mode active")
+    elif not API_KEY:
+        log.info("No API keys — public data only (backtest mode)")
     return ex
 
 
