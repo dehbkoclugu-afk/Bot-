@@ -1,0 +1,7 @@
+.env
+*.log
+state.json
+backtest_equity.png
+__pycache__/
+*.pyc
+.venv/
