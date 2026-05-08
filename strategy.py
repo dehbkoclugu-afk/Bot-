@@ -20,7 +20,7 @@ Giriş Mantığı (ENTRY_MODE = "stochrsi")
 
 import pandas as pd
 from config import (
-    MA_FAST, MA_SLOW, MA_TREND, MA_TYPE,
+    MA_FASTEST, MA_FAST, MA_SLOW, MA_TREND, MA_TYPE,
     ATR_PERIOD, ADX_PERIOD, ADX_THRESHOLD,
     RSI_PERIOD,
     SRSI_PERIOD, SRSI_K_SMOOTH, SRSI_D_SMOOTH,
@@ -95,9 +95,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ma_fn = _ema if MA_TYPE == "ema" else _sma
 
     df = df.copy()
-    df["ma_fast"]  = ma_fn(df["close"], MA_FAST)
-    df["ma_slow"]  = ma_fn(df["close"], MA_SLOW)
-    df["ma_trend"] = ma_fn(df["close"], MA_TREND)
+    df["ma_fastest"] = ma_fn(df["close"], MA_FASTEST)
+    df["ma_fast"]    = ma_fn(df["close"], MA_FAST)
+    df["ma_slow"]    = ma_fn(df["close"], MA_SLOW)
+    df["ma_trend"]   = ma_fn(df["close"], MA_TREND)
     df["atr"]      = _atr(df, ATR_PERIOD)
     df["rsi"]      = _rsi(df["close"], RSI_PERIOD)
     df["adx"]      = _adx(df, ADX_PERIOD)
@@ -148,17 +149,18 @@ def get_signal(df: pd.DataFrame, state: dict | None = None) -> dict:
     prv = df.iloc[-3]   # bir önceki mum
 
     base = {
-        "signal"   : "none",
-        "price"    : float(row["close"]),
-        "atr"      : float(row["atr"]),
-        "ma_fast"  : float(row["ma_fast"]),
-        "ma_slow"  : float(row["ma_slow"]),
-        "ma_trend" : float(row["ma_trend"]),
-        "rsi"      : float(row["rsi"]),
-        "adx"      : float(row["adx"]),
-        "srsi_k"   : float(row["srsi_k"]),
-        "srsi_d"   : float(row["srsi_d"]),
-        "bull"     : bool(row["close"] > row["ma_trend"]),
+        "signal"     : "none",
+        "price"      : float(row["close"]),
+        "atr"        : float(row["atr"]),
+        "ma_fastest" : float(row["ma_fastest"]),
+        "ma_fast"    : float(row["ma_fast"]),
+        "ma_slow"    : float(row["ma_slow"]),
+        "ma_trend"   : float(row["ma_trend"]),
+        "rsi"        : float(row["rsi"]),
+        "adx"        : float(row["adx"]),
+        "srsi_k"     : float(row["srsi_k"]),
+        "srsi_d"     : float(row["srsi_d"]),
+        "bull"       : bool(row["close"] > row["ma_trend"]),
     }
 
     price      = base["price"]
@@ -174,7 +176,25 @@ def get_signal(df: pd.DataFrame, state: dict | None = None) -> dict:
 
     mode = ENTRY_MODE if state is not None else "ma_cross"
 
-    if mode == "ma_cross":
+    if mode == "quad_ma":
+        e1     = float(row["ma_fastest"])   # EMA5
+        e1_prv = float(prv["ma_fastest"])
+        ef     = float(row["ma_fast"])      # EMA15
+        ef_prv = float(prv["ma_fast"])
+        es     = float(row["ma_slow"])      # EMA50
+        et     = float(row["ma_trend"])     # EMA200
+
+        q_cross_up   = e1_prv <= ef_prv and e1 > ef
+        q_cross_down = e1_prv >= ef_prv and e1 < ef
+        full_bull    = e1 > ef > es > et
+        full_bear    = e1 < ef < es < et
+
+        if q_cross_up and full_bull and adx >= ADX_THRESHOLD and vol_ok:
+            base["signal"] = "buy"
+        elif q_cross_down and full_bear and adx >= ADX_THRESHOLD and vol_ok:
+            base["signal"] = "sell"
+
+    elif mode == "ma_cross":
         prev_above = bool(prv["ma_fast"] > prv["ma_slow"])
         curr_above = bool(row["ma_fast"] > row["ma_slow"])
         if not prev_above and curr_above and bull and adx >= ADX_THRESHOLD and vol_ok:

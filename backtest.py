@@ -121,17 +121,23 @@ def run_backtest(
 
     # Göstergeleri hazırla
     df = df.copy()
-    df["ef"]     = _ema(df["close"], fast)
-    df["es"]     = _ema(df["close"], slow)
-    df["et"]     = _ema(df["close"], trend)
-    df["atr"]    = _atr(df, 14)
-    df["rsi"]    = _rsi(df["close"])
-    df["adx"]    = _adx(df)
-    sk, sd       = _stochrsi(df["close"])
-    df["sk"]     = sk
-    df["sd"]     = sd
-    df["vol_ma"] = df["volume"].rolling(20).mean()
+    df["e1"]       = _ema(df["close"], 5)    # quad MA en hızlı bileşen (EMA5)
+    df["ef"]       = _ema(df["close"], fast)
+    df["es"]       = _ema(df["close"], slow)
+    df["et"]       = _ema(df["close"], trend)
+    df["atr"]      = _atr(df, 14)
+    df["rsi"]      = _rsi(df["close"])
+    df["adx"]      = _adx(df)
+    sk, sd         = _stochrsi(df["close"])
+    df["sk"]       = sk
+    df["sd"]       = sd
+    df["vol_ma"]   = df["volume"].rolling(20).mean()
     df = df.dropna().reset_index()
+    # Donchian kanalı (sadece breakout modunda kullanılır; dropna'dan sonra hesaplanır)
+    # 96-bar ≈ 4 gün giriş, 48-bar ≈ 2 gün çıkış (turtle trading uyarlaması)
+    df["don_high"] = df["high"].rolling(96, min_periods=1).max()
+    df["don_low"]  = df["low"].rolling(96, min_periods=1).min()
+    df["don_exit"] = df["low"].rolling(48, min_periods=1).min()
 
     balance  = initial_balance
     equity   = []
@@ -173,9 +179,41 @@ def run_backtest(
                         (sd_dir == -1 and price <= position["cap_tp"])
             sl_hit    = (sd_dir ==  1 and price <= position["sl"]) or \
                         (sd_dir == -1 and price >= position["sl"])
+            # breakout: Donchian düşüğün altına inince çıkış
+            if entry_mode == "breakout":
+                don_exit_now = float(row["don_exit"])
+                don_exit_brk = (position["side"] == "buy" and price < don_exit_now) or \
+                               (position["side"] == "sell" and price > don_exit_now)
+                if don_exit_brk:
+                    sd_dir = 1 if position["side"] == "buy" else -1
+                    pnl    = (price - position["entry"]) * position["qty"] * sd_dir
+                    fee    = price * position["qty"] * COMMISSION
+                    net    = pnl - fee
+                    balance += net
+                    trades.append({
+                        "entry_time": position["entry_time"], "exit_time": row["timestamp"],
+                        "side": position["side"], "entry": position["entry"],
+                        "exit": price, "qty": position["qty"],
+                        "pnl_gross": round(pnl, 4), "pnl_net": round(net, 4),
+                        "reason": "don_exit",
+                        "peak_move": round(abs(position["extreme"] - position["entry"]), 4),
+                    })
+                    position = None
+                    continue
+
+            # quad_ma modunda EMA5/EMA_fast çaprazı; diğer modlarda EMA21/EMA55 çaprazı
+            if entry_mode == "quad_ma":
+                e1_now = float(row["e1"])
+                e1_prv = float(df.loc[i - 1, "e1"])
+                ef_now = float(row["ef"]); ef_prv = float(df.loc[i - 1, "ef"])
+                _cross_down = e1_prv > ef_prv and e1_now <= ef_now
+                _cross_up   = e1_prv < ef_prv and e1_now >= ef_now
+            else:
+                _cross_down = cross_down
+                _cross_up   = cross_up
             cross_hit = exit_on_cross and (
-                (position["side"] == "buy"  and cross_down) or
-                (position["side"] == "sell" and cross_up)
+                (position["side"] == "buy"  and _cross_down) or
+                (position["side"] == "sell" and _cross_up)
             )
 
             if cap_hit or sl_hit or cross_hit:
@@ -269,6 +307,36 @@ def run_backtest(
                     if pb_short["oversold_seen"] and k_cross_dn and adx >= adx_min and vol_ok:
                         sig = "sell"
                         pb_short["armed"] = False; pb_short["oversold_seen"] = False
+
+        # --- Dörtlü MA (quad_ma): EMA5/15/50/200 hizalaması ---
+        elif entry_mode == "quad_ma":
+            e1   = float(row["e1"])    # EMA5
+            e1_1 = float(df.loc[i - 1, "e1"])
+            ef_v = float(row["ef"])    # EMA fast (15 veya 21)
+            ef_1 = float(df.loc[i - 1, "ef"])
+            # Long: EMA5 EMA_fast'ı yukarı kesiyor VE EMA_fast > EMA_slow > EMA_trend (tam boğa)
+            q_cross_up   = e1_1 <= ef_1 and e1 > ef_v
+            q_cross_down = e1_1 >= ef_1 and e1 < ef_v
+            full_bull = e1 > ef_v > float(row["es"]) > float(row["et"])
+            full_bear = e1 < ef_v < float(row["es"]) < float(row["et"])
+
+            if q_cross_up and full_bull and adx >= adx_min and vol_ok:
+                sig = "buy"
+            elif not long_only and q_cross_down and full_bear and adx >= adx_min and vol_ok:
+                sig = "sell"
+
+        # --- Donchian Kanal Kırılımı (breakout) ---
+        elif entry_mode == "breakout":
+            don_high = float(row["don_high"])   # N-bar yüksek
+            don_low  = float(row["don_low"])    # N-bar düşük
+            don_exit = float(row["don_exit"])   # çıkış için M-bar düşük
+            don_h1   = float(df.loc[i - 1, "don_high"])
+            don_l1   = float(df.loc[i - 1, "don_low"])
+            # Fiyat N-bar yüksekliğini kırdı → giriş
+            if price > don_h1 and bull and adx >= adx_min and vol_ok:
+                sig = "buy"
+            elif not long_only and price < don_l1 and not bull and adx >= adx_min and vol_ok:
+                sig = "sell"
 
         if sig is None:
             continue
@@ -384,7 +452,7 @@ def main():
     parser.add_argument("--long-only",    action="store_true")
     parser.add_argument("--plot",         action="store_true")
     parser.add_argument("--entry-mode",   default="ma_cross",
-                        choices=["ma_cross", "rsi_pullback", "stochrsi"])
+                        choices=["ma_cross", "rsi_pullback", "stochrsi", "quad_ma", "breakout"])
     parser.add_argument("--no-cross-exit", action="store_true",
                         help="MA tersine dönüşünde çıkışı devre dışı bırak")
     parser.add_argument("--compare",      action="store_true",
@@ -409,12 +477,21 @@ def main():
     use_cross = not args.no_cross_exit
 
     if args.compare:
+        # Her mod için optimize edilmiş parametreler
+        mode_params = {
+            "ma_cross"   : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
+            "quad_ma"    : dict(fast=15, slow=50, sl_mult=1.2, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
+            "breakout"   : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=8.0, trail_be=1.5, trail_act=2.5, trail_dist=2.0),
+            "rsi_pullback": dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
+            "stochrsi"   : dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
+        }
         print(f"\n{'Mod':<15} {'Getiri':>8} {'İşlem':>6} {'KazO%':>7} {'PF':>6}  {'Ort.Kazan':>10}  {'Ort.Kayıp':>10}")
         print("─" * 68)
-        for mode in ["ma_cross", "rsi_pullback", "stochrsi"]:
+        for mode in ["ma_cross", "quad_ma", "breakout", "rsi_pullback", "stochrsi"]:
+            kw = mode_params.get(mode, {})
             r = run_backtest(df, initial_balance=args.balance,
                              long_only=args.long_only, entry_mode=mode,
-                             exit_on_cross=use_cross)
+                             exit_on_cross=use_cross, **kw)
             print(f"{mode:<15} {r['total_return_pct']:>+7.2f}% {r['n_trades']:>6} "
                   f"{r['win_rate_pct']:>6.1f}% {r['profit_factor']:>6.2f}  "
                   f"{r['avg_win']:>+10.2f}  {r['avg_loss']:>+10.2f}")

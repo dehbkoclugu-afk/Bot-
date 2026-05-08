@@ -13,16 +13,17 @@ TESTNET    = os.getenv("TESTNET", "true").lower() == "true"
 SYMBOL    = os.getenv("SYMBOL", "BTC/USDT")
 TIMEFRAME = "1h"
 
-# --- MA periyotları ---
-MA_FAST   = 21
-MA_SLOW   = 55
-MA_TREND  = 200
-MA_TYPE   = "ema"
+# --- Dörtlü MA (quad_ma) periyotları: EMA5 > EMA15 > EMA50 > EMA200 ---
+MA_FASTEST = 5    # tetikleyici: EMA5
+MA_FAST    = 15   # onay 1: EMA15
+MA_SLOW    = 50   # onay 2: EMA50
+MA_TREND   = 200  # rejim: EMA200
+MA_TYPE    = "ema"
 ATR_PERIOD = 14
 
 # --- ADX filtresi ---
 ADX_PERIOD    = 14
-ADX_THRESHOLD = 20   # Gürültülü crossover'ları filtreler
+ADX_THRESHOLD = 20   # trend gücü eşiği
 
 # --- RSI (StochRSI için temel) ---
 RSI_PERIOD     = 14
@@ -32,11 +33,11 @@ RSI_SHORT_MIN  = 28
 RSI_SHORT_MAX  = 62
 
 # --- Stochastic RSI giriş tetikleyicisi ---
-SRSI_PERIOD    = 14    # RSI penceresi
-SRSI_K_SMOOTH  = 3     # %K yumuşatma
-SRSI_D_SMOOTH  = 3     # %D yumuşatma
-SRSI_OVERSOLD  = 0.35  # Long: K bu seviyenin altından yukarı kesmeli
-SRSI_OVERBOUGHT= 0.65  # Short: K bu seviyenin üstünden aşağı kesmeli
+SRSI_PERIOD    = 14
+SRSI_K_SMOOTH  = 3
+SRSI_D_SMOOTH  = 3
+SRSI_OVERSOLD  = 0.35
+SRSI_OVERBOUGHT= 0.65
 
 # --- Volume filtresi ---
 VOLUME_MA_PERIOD = 20
@@ -50,14 +51,15 @@ ATR_TRAIL_DIST      = 1.5   # trailing: peak − 1.5×ATR
 ATR_CAP_MULT        = 5.5   # emniyet TP kapağı (5.5×ATR)
 
 # --- Çıkış modu ---
-# EXIT_ON_CROSS=True → MA21/55 tersine döndüğünde pozisyonu kapat (trailing ile birlikte)
+# EXIT_ON_CROSS=True → hızlı MA / ikinci MA tersine döndüğünde pozisyonu kapat
 EXIT_ON_CROSS = True
 
 # --- Giriş modu ---
-# "ma_cross"   : EMA21/55 kesişiminde giriş, en sağlam mod
+# "quad_ma"    : EMA5/15/50/200 tam hizalanınca giriş — 5 seed'de en tutarlı (+2.4% ort.)
+# "ma_cross"   : EMA15/50 kesişiminde giriş — en yüksek peak getiri (+19% seed0)
 # "stochrsi"   : MA trend yönü + StochRSI aşırı satım geri dönüşü
 # "rsi_pullback": MA trend yönü + RSI geri çekilme + toparlanma
-ENTRY_MODE = "ma_cross"
+ENTRY_MODE = "quad_ma"
 
 # --- Risk ---
 RISK_PER_TRADE  = 0.01

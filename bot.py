@@ -33,7 +33,7 @@ from risk_manager import (
     update_trailing_stop, check_exit,
 )
 from config import (
-    SYMBOL, TIMEFRAME, MA_FAST, MA_SLOW, MA_TREND, ENTRY_MODE, EXIT_ON_CROSS,
+    SYMBOL, TIMEFRAME, MA_FASTEST, MA_FAST, MA_SLOW, MA_TREND, ENTRY_MODE, EXIT_ON_CROSS,
     ATR_SL_MULT, ATR_CAP_MULT, ATR_TRAIL_BREAKEVEN, ATR_TRAIL_ACTIVATE, ATR_TRAIL_DIST,
     RISK_PER_TRADE, POLL_INTERVAL_SEC, CANDLES_REQUIRED, LOG_FILE,
 )
@@ -276,12 +276,19 @@ class TradingBot:
 
             # EXIT_ON_CROSS: Son kapanan mumda MA tersine döndüyse kapat
             if EXIT_ON_CROSS:
-                ma_fast_now = float(df_ind["ma_fast"].iloc[-2])  # son kapanan
-                ma_slow_now = float(df_ind["ma_slow"].iloc[-2])
-                ma_fast_prv = float(df_ind["ma_fast"].iloc[-3])  # önceki kapanan
-                ma_slow_prv = float(df_ind["ma_slow"].iloc[-3])
-                cross_down = ma_fast_prv > ma_slow_prv and ma_fast_now <= ma_slow_now
-                cross_up   = ma_fast_prv < ma_slow_prv and ma_fast_now >= ma_slow_now
+                if ENTRY_MODE == "quad_ma":
+                    # quad_ma: EMA5/EMA15 çifti ile çıkış
+                    fast_a_now = float(df_ind["ma_fastest"].iloc[-2])
+                    fast_b_now = float(df_ind["ma_fast"].iloc[-2])
+                    fast_a_prv = float(df_ind["ma_fastest"].iloc[-3])
+                    fast_b_prv = float(df_ind["ma_fast"].iloc[-3])
+                else:
+                    fast_a_now = float(df_ind["ma_fast"].iloc[-2])
+                    fast_b_now = float(df_ind["ma_slow"].iloc[-2])
+                    fast_a_prv = float(df_ind["ma_fast"].iloc[-3])
+                    fast_b_prv = float(df_ind["ma_slow"].iloc[-3])
+                cross_down = fast_a_prv > fast_b_prv and fast_a_now <= fast_b_now
+                cross_up   = fast_a_prv < fast_b_prv and fast_a_now >= fast_b_now
                 if (pos["side"] == "buy" and cross_down) or (pos["side"] == "sell" and cross_up):
                     self._close_position(current_price, "cross_exit")
                     return
