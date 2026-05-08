@@ -1,38 +1,40 @@
 """
-Crypto Trading Bot — MA Crossover (5h / 12h)
-=============================================
+Kripto Trading Botu — EMA 21/55 + 200 Rejim Filtresi
+======================================================
 
-Strategy
---------
-  BUY  when 5-hour MA crosses ABOVE 12-hour MA (golden cross)
-  SELL when 5-hour MA crosses BELOW 12-hour MA (death  cross)
+Strateji Özeti
+--------------
+  LONG  : EMA21 EMA55'i yukari keser + fiyat EMA200 üstünde + RSI[38-72] + ADX≥20
+  SHORT : EMA21 EMA55'i asagi keser + fiyat EMA200 altinda + RSI[28-62] + ADX≥20
 
-Risk Management
----------------
-  Stop-Loss   : entry − 1.5 × ATR   (long)
-  Take-Profit : entry + 3.0 × ATR   (long)  → 2:1 reward-to-risk
-  Position    : 1% of account equity risked per trade
+Risk Yönetimi
+-------------
+  Stop-Loss   : giriş − 1.5 × ATR
+  Take-Profit : giriş + 3.5 × ATR  (2.3:1 ödül/risk)
+  Pozisyon    : bakiyenin %1'i her işlemde riske edilir
+  Erken Çıkış: MA tersine kesişirse pozisyon kapatılır
 
-Run
----
-  python bot.py              # live trading (configure .env first)
-  python bot.py --dry-run    # paper trading (no real orders)
+Çalıştırma
+----------
+  python bot.py              # canlı
+  python bot.py --dry-run    # kağıt üzerinde (gerçek emir yok)
+  python bot.py --dry-run --long-only   # yalnızca long (spot cüzdan için)
 """
 
 import argparse
+import json
 import logging
 import time
-import json
 from datetime import datetime
 from pathlib import Path
 
 import exchange_client as ex
-from strategy     import get_signal
+from strategy     import get_signal, should_exit_early
 from risk_manager import calculate_levels, calculate_position_size, check_exit
 from config       import (
-    SYMBOL, TIMEFRAME, MA_FAST, MA_SLOW, MA_TYPE,
+    SYMBOL, TIMEFRAME, MA_FAST, MA_SLOW, MA_TREND,
     ATR_SL_MULT, ATR_TP_MULT, RISK_PER_TRADE,
-    POLL_INTERVAL_SEC, MAX_OPEN_TRADES, LOG_FILE,
+    POLL_INTERVAL_SEC, CANDLES_REQUIRED, EXIT_ON_CROSS, LOG_FILE,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,7 +52,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# State file (survives restarts)
+# Kalıcı durum
 # ---------------------------------------------------------------------------
 
 STATE_FILE = Path("state.json")
@@ -66,28 +68,26 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
 
 
 # ---------------------------------------------------------------------------
-# Core trading logic
+# Bot
 # ---------------------------------------------------------------------------
 
 class TradingBot:
-    def __init__(self, dry_run: bool = False):
-        self.dry_run = dry_run
-        self.state   = _load_state()
+    def __init__(self, dry_run: bool = False, long_only: bool = False):
+        self.dry_run   = dry_run
+        self.long_only = long_only
+        self.state     = _load_state()
         mode = "DRY-RUN" if dry_run else "LIVE"
-        log.info("=" * 60)
-        log.info("Bot started  [%s]  %s  %s/%sh  MA%d×MA%d",
-                 mode, SYMBOL, MA_FAST, MA_SLOW, MA_FAST, MA_SLOW)
-        log.info("SL=%.1f×ATR  TP=%.1f×ATR  Risk=%.0f%%/trade",
+        lo   = "  [LONG-ONLY]" if long_only else ""
+        log.info("=" * 64)
+        log.info("Bot başlatıldı  [%s]%s  %s", mode, lo, SYMBOL)
+        log.info("Strateji: EMA%d/EMA%d  Rejim: EMA%d", MA_FAST, MA_SLOW, MA_TREND)
+        log.info("SL=%.1f×ATR  TP=%.1f×ATR  Risk=%.0f%%/işlem",
                  ATR_SL_MULT, ATR_TP_MULT, RISK_PER_TRADE * 100)
-        log.info("=" * 60)
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+        log.info("=" * 64)
 
     @property
     def position(self) -> dict | None:
@@ -99,43 +99,28 @@ class TradingBot:
         _save_state(self.state)
 
     # ------------------------------------------------------------------
-    # Order helpers (dry-run aware)
+    # Emir yardımcıları
     # ------------------------------------------------------------------
 
-    def _open_long(self, price: float, qty: float, tp: float, sl: float):
-        log.info(">>> OPEN LONG  qty=%.6f  entry=%.4f  TP=%.4f  SL=%.4f",
-                 qty, price, tp, sl)
+    def _open_position(self, side: str, price: float, qty: float,
+                       tp: float, sl: float):
+        log.info(">>> PozisYon AÇ [%s]  qty=%.6f  giriş=%.2f  TP=%.2f  SL=%.2f",
+                 side.upper(), qty, price, tp, sl)
+
         if not self.dry_run:
-            order = ex.place_market_order("buy", qty)
+            order = ex.place_market_order(side, qty)
             if not order:
+                log.error("Emir verilemedi — pozisyon açılmadı")
                 return
             price = float(order.get("average") or price)
 
         self.position = {
-            "side"        : "buy",
-            "entry"       : price,
-            "qty"         : qty,
-            "take_profit" : tp,
-            "stop_loss"   : sl,
-            "opened_at"   : datetime.utcnow().isoformat(),
-        }
-
-    def _open_short(self, price: float, qty: float, tp: float, sl: float):
-        log.info(">>> OPEN SHORT qty=%.6f  entry=%.4f  TP=%.4f  SL=%.4f",
-                 qty, price, tp, sl)
-        if not self.dry_run:
-            order = ex.place_market_order("sell", qty)
-            if not order:
-                return
-            price = float(order.get("average") or price)
-
-        self.position = {
-            "side"        : "sell",
-            "entry"       : price,
-            "qty"         : qty,
-            "take_profit" : tp,
-            "stop_loss"   : sl,
-            "opened_at"   : datetime.utcnow().isoformat(),
+            "side"      : side,
+            "entry"     : price,
+            "qty"       : qty,
+            "take_profit": tp,
+            "stop_loss" : sl,
+            "opened_at" : datetime.utcnow().isoformat(),
         }
 
     def _close_position(self, current_price: float, reason: str):
@@ -143,16 +128,19 @@ class TradingBot:
         if pos is None:
             return
 
-        side     = pos["side"]
-        entry    = pos["entry"]
-        qty      = pos["qty"]
+        side       = pos["side"]
+        entry      = pos["entry"]
+        qty        = pos["qty"]
         close_side = "sell" if side == "buy" else "buy"
+        direction  = 1 if side == "buy" else -1
 
-        pnl_pct = ((current_price - entry) / entry * 100) * (1 if side == "buy" else -1)
-        pnl_abs = (current_price - entry) * qty * (1 if side == "buy" else -1)
+        pnl_pct = (current_price - entry) / entry * 100 * direction
+        pnl_abs = (current_price - entry) * qty * direction
 
-        log.info("<<< CLOSE %s  reason=%s  exit=%.4f  PnL=%.2f%%  (%.4f USDT)",
-                 side.upper(), reason, current_price, pnl_pct, pnl_abs)
+        log.info(
+            "<<< PozisYon KAP [%s]  neden=%-12s  çıkış=%.2f  PnL=%+.2f%%  (%+.4f USDT)",
+            side.upper(), reason, current_price, pnl_pct, pnl_abs,
+        )
 
         if not self.dry_run:
             ex.place_market_order(close_side, qty)
@@ -172,50 +160,55 @@ class TradingBot:
         self._print_stats()
 
     # ------------------------------------------------------------------
-    # Stats
+    # İstatistik
     # ------------------------------------------------------------------
 
     def _print_stats(self):
         trades = self.state.get("trades", [])
         if not trades:
             return
-        wins  = [t for t in trades if t["pnl_abs"] > 0]
-        losses = [t for t in trades if t["pnl_abs"] <= 0]
+        wins      = [t for t in trades if t["pnl_abs"] > 0]
+        losses    = [t for t in trades if t["pnl_abs"] <= 0]
         total_pnl = sum(t["pnl_abs"] for t in trades)
-        win_rate  = len(wins) / len(trades) * 100 if trades else 0
-        log.info("--- Stats: %d trades | WR=%.0f%% | Total PnL=%.4f USDT | W=%d L=%d",
-                 len(trades), win_rate, total_pnl, len(wins), len(losses))
+        win_rate  = len(wins) / len(trades) * 100
+        profit_factor = (
+            abs(sum(t["pnl_abs"] for t in wins) / sum(t["pnl_abs"] for t in losses))
+            if losses and sum(t["pnl_abs"] for t in losses) != 0 else float("inf")
+        )
+        log.info(
+            "─── İstatistik: %d işlem | KazO=%.0f%% | PF=%.2f | Toplam PnL=%+.4f USDT",
+            len(trades), win_rate, profit_factor, total_pnl,
+        )
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Ana döngü
     # ------------------------------------------------------------------
 
     def run(self):
-        log.info("Bot running. Press Ctrl+C to stop.")
+        log.info("Bot çalışıyor. Durdurmak için Ctrl+C basın.")
         while True:
             try:
                 self._tick()
             except KeyboardInterrupt:
-                log.info("Bot stopped by user.")
+                log.info("Bot kullanıcı tarafından durduruldu.")
                 self._print_stats()
                 break
             except Exception as exc:
-                log.exception("Unexpected error: %s — retrying next tick", exc)
+                log.exception("Beklenmedik hata: %s — sonraki turda tekrar denenecek", exc)
             time.sleep(POLL_INTERVAL_SEC)
 
     def _tick(self):
-        # 1. Fetch market data
-        df = ex.fetch_ohlcv()
+        df = ex.fetch_ohlcv(limit=CANDLES_REQUIRED)
         if df is None or df.empty:
-            log.warning("No OHLCV data received — skipping tick")
+            log.warning("OHLCV verisi alınamadı — tur atlanıyor")
             return
 
         current_price = ex.fetch_ticker_price()
         if current_price is None:
-            log.warning("Could not fetch current price — skipping tick")
+            log.warning("Güncel fiyat alınamadı — tur atlanıyor")
             return
 
-        # 2. Evaluate open position for TP/SL
+        # 1. Açık pozisyon kontrolü
         if self.position:
             pos    = self.position
             result = check_exit(
@@ -226,70 +219,78 @@ class TradingBot:
                 self._close_position(current_price, result)
                 return
 
-            log.debug(
-                "Position OPEN [%s]  entry=%.4f  curr=%.4f  TP=%.4f  SL=%.4f",
-                pos["side"], pos["entry"], current_price,
+            # Erken çıkış: MA tersine döndüyse
+            if EXIT_ON_CROSS and should_exit_early(df, pos["side"]):
+                self._close_position(current_price, "ma_cross_exit")
+                return
+
+            log.info(
+                "Açık [%s]  giriş=%.2f  güncel=%.2f  TP=%.2f  SL=%.2f",
+                pos["side"].upper(), pos["entry"], current_price,
                 pos["take_profit"], pos["stop_loss"],
             )
-            return   # don't open another position while one is active
+            return
 
-        # 3. Check for signal (no open position)
-        if len(self.state.get("trades", [])) >= MAX_OPEN_TRADES * 10:
-            pass   # no hard limit on total trades
-
+        # 2. Yeni sinyal kontrolü
         sig = get_signal(df)
+
+        bull_str = "boğa" if sig.get("bull") else "ayı"
         log.info(
-            "Candle check  price=%.4f  MA%d=%.4f  MA%d=%.4f  signal=%s",
+            "Analiz  fiyat=%.2f  EMA%d=%.2f  EMA%d=%.2f  RSI=%.1f  ADX=%.1f  rejim=%s  sinyal=%s",
             current_price,
             MA_FAST, sig.get("ma_fast", 0),
             MA_SLOW, sig.get("ma_slow", 0),
-            sig["signal"].upper(),
+            sig.get("rsi", 0), sig.get("adx", 0),
+            bull_str, sig["signal"].upper(),
         )
 
         if sig["signal"] == "none":
             return
 
-        # 4. Calculate TP / SL / position size
-        side   = sig["signal"]     # 'buy' or 'sell'
+        # Long-only modunda short sinyali yok say
+        if self.long_only and sig["signal"] == "sell":
+            log.info("Long-only mod: SELL sinyali yok sayıldı")
+            return
+
+        side   = sig["signal"]
         price  = sig["price"]
         atr    = sig["atr"]
         levels = calculate_levels(price, atr, side)
         tp     = levels["take_profit"]
         sl     = levels["stop_loss"]
 
-        balance = ex.fetch_balance() if not self.dry_run else 10_000.0
+        balance = 10_000.0 if self.dry_run else ex.fetch_balance()
         qty     = calculate_position_size(balance, price, sl)
 
         if qty <= 0:
-            log.warning("Calculated qty is zero — skipping signal")
+            log.warning("Pozisyon boyutu sıfır — sinyal atlanıyor")
             return
 
         log.info(
-            "Signal: %s  price=%.4f  TP=%.4f  SL=%.4f  RR=%.2f  qty=%.6f",
+            "SİNYAL %s  fiyat=%.2f  TP=%.2f  SL=%.2f  RR=%.2f  qty=%.6f",
             side.upper(), price, tp, sl, levels["rr_ratio"], qty,
         )
 
-        # 5. Open position
-        if side == "buy":
-            self._open_long(price, qty, tp, sl)
-        else:
-            self._open_short(price, qty, tp, sl)
+        self._open_position(side, price, qty, tp, sl)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Başlangıç noktası
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="MA Crossover Crypto Trading Bot")
+    parser = argparse.ArgumentParser(description="EMA 21/55 Kripto Trading Botu")
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Paper trading — signals are logged but no real orders are placed",
+        "--dry-run", action="store_true",
+        help="Kağıt üzerinde test — gerçek emir verilmez",
+    )
+    parser.add_argument(
+        "--long-only", action="store_true",
+        help="Yalnızca LONG pozisyon aç (spot cüzdan için)",
     )
     args = parser.parse_args()
 
-    bot = TradingBot(dry_run=args.dry_run)
+    bot = TradingBot(dry_run=args.dry_run, long_only=args.long_only)
     bot.run()
 
 
