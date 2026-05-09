@@ -40,11 +40,13 @@ def calculate_levels(entry: float, atr: float, side: str) -> dict:
     }
 
 
-def calculate_position_size(balance: float, entry: float, stop_loss: float) -> float:
+def calculate_position_size(balance: float, entry: float, stop_loss: float,
+                             trade_risk: float = None) -> float:
     sl_distance = abs(entry - stop_loss)
     if sl_distance == 0:
         return 0.0
-    return round(balance * RISK_PER_TRADE / sl_distance, 8)
+    risk = trade_risk if trade_risk is not None else RISK_PER_TRADE
+    return round(balance * risk / sl_distance, 8)
 
 
 def update_trailing_stop(

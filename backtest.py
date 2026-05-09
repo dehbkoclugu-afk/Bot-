@@ -69,6 +69,63 @@ def _stochrsi(s, rsi_p=14, k_p=3, d_p=3):
     return K, D
 
 
+def _macd(s, fast=12, slow=26, signal=9):
+    """MACD çizgisi, sinyal çizgisi ve histogram döndürür."""
+    line = _ema(s, fast) - _ema(s, slow)
+    sig  = _ema(line, signal)
+    hist = line - sig
+    return line, sig, hist
+
+
+def _market_score(price, ema21, ema55, ema200, adx, rsi, prev_close, prev2_close):
+    """0-10 arası piyasa kalite skoru. ≥6 giriş için yeterli, ≥9 güçlü sinyal."""
+    s = 0
+    if price > ema200:           s += 2  # boğa rejimi
+    if ema21 > ema55:            s += 2  # orta vadeli trend
+    if adx > 25:                 s += 2  # güçlü trend
+    elif adx > 20:               s += 1  # zayıf trend
+    if 50 <= rsi <= 70:          s += 2  # pozitif momentum
+    elif 45 <= rsi <= 72:        s += 1
+    if price > prev_close:       s += 1  # 1-bar momentum
+    if price > prev2_close:      s += 1  # 2-bar momentum
+    return s
+
+
+def _supertrend(df, atr_period=10, multiplier=3.0):
+    """
+    Supertrend göstergesi: trend (1=boğa/-1=ayı) ve destek çizgisi döndürür.
+    Trend=1 iken destek = alt bant; trend=-1 iken direnç = üst bant.
+    """
+    atr   = _atr(df, atr_period)
+    hl2   = (df["high"] + df["low"]) / 2
+    close = df["close"].values
+    upper = (hl2 + multiplier * atr).values
+    lower = (hl2 - multiplier * atr).values
+    n = len(df)
+
+    fu = upper.copy()   # final upper band
+    fl = lower.copy()   # final lower band
+    trend   = [1] * n
+    support = [0.0] * n
+
+    for i in range(1, n):
+        fu[i] = upper[i] if upper[i] < fu[i-1] or close[i-1] > fu[i-1] else fu[i-1]
+        fl[i] = lower[i] if lower[i] > fl[i-1] or close[i-1] < fl[i-1] else fl[i-1]
+
+        if trend[i-1] == -1 and close[i] > fu[i-1]:
+            trend[i] = 1
+        elif trend[i-1] == 1 and close[i] < fl[i-1]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i-1]
+
+        support[i] = fl[i] if trend[i] == 1 else fu[i]
+
+    import pandas as pd
+    return (pd.Series(trend, index=df.index),
+            pd.Series(support, index=df.index))
+
+
 # ---------------------------------------------------------------------------
 # Trailing stop yardımcısı
 # ---------------------------------------------------------------------------
@@ -117,6 +174,15 @@ def run_backtest(
     entry_mode: str = "ma_cross",
     risk: float = 0.01,
     long_only: bool = False,
+    risk_high: float = 0.05,
+    risk_low: float = 0.01,
+    score_min: int = 6,
+    score_high: int = 9,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal_period: int = 9,
+    st_multiplier: float = 7.0,
+    st_atr_period: int = 14,
 ) -> dict:
 
     # Göstergeleri hazırla
@@ -132,6 +198,14 @@ def run_backtest(
     df["sk"]       = sk
     df["sd"]       = sd
     df["vol_ma"]   = df["volume"].rolling(20).mean()
+    ml, ms, mh     = _macd(df["close"], macd_fast, macd_slow, macd_signal_period)
+    df["macd_l"]   = ml
+    df["macd_s"]   = ms
+    df["macd_h"]   = mh
+    df["rsi_ind"]  = _rsi(df["close"])
+    st_trend, st_support = _supertrend(df, atr_period=st_atr_period, multiplier=st_multiplier)
+    df["st_trend"]   = st_trend
+    df["st_support"] = st_support
     df = df.dropna().reset_index()
     # Donchian kanalı (sadece breakout modunda kullanılır; dropna'dan sonra hesaplanır)
     # 96-bar ≈ 4 gün giriş, 48-bar ≈ 2 gün çıkış (turtle trading uyarlaması)
@@ -179,6 +253,36 @@ def run_backtest(
                         (sd_dir == -1 and price <= position["cap_tp"])
             sl_hit    = (sd_dir ==  1 and price <= position["sl"]) or \
                         (sd_dir == -1 and price >= position["sl"])
+            # supertrend: destek çizgisini SL olarak güncelle, flip'te çık
+            if entry_mode == "supertrend":
+                sup_now = float(row["st_support"])
+                if position["side"] == "buy":
+                    position["sl"] = max(position["sl"], sup_now)
+                else:
+                    position["sl"] = min(position["sl"], sup_now)
+                st_now = int(row["st_trend"])
+                st_prv = int(df.loc[i - 1, "st_trend"])
+                st_flip_bear = st_prv == 1 and st_now == -1
+                st_flip_bull = st_prv == -1 and st_now == 1
+                st_exit = (position["side"] == "buy" and st_flip_bear) or \
+                          (position["side"] == "sell" and st_flip_bull)
+                if st_exit:
+                    sd_dir = 1 if position["side"] == "buy" else -1
+                    pnl    = (price - position["entry"]) * position["qty"] * sd_dir
+                    fee    = price * position["qty"] * COMMISSION
+                    net    = pnl - fee
+                    balance += net
+                    trades.append({
+                        "entry_time": position["entry_time"], "exit_time": row["timestamp"],
+                        "side": position["side"], "entry": position["entry"],
+                        "exit": price, "qty": position["qty"],
+                        "pnl_gross": round(pnl, 4), "pnl_net": round(net, 4),
+                        "reason": "st_flip",
+                        "peak_move": round(abs(position["extreme"] - position["entry"]), 4),
+                    })
+                    position = None
+                    continue
+
             # breakout: Donchian düşüğün altına inince çıkış
             if entry_mode == "breakout":
                 don_exit_now = float(row["don_exit"])
@@ -338,13 +442,53 @@ def run_backtest(
             elif not long_only and price < don_l1 and not bull and adx >= adx_min and vol_ok:
                 sig = "sell"
 
+        # --- Supertrend: trend flip + EMA200 rejim, destek çizgisi = SL ---
+        elif entry_mode == "supertrend":
+            st_now = int(row["st_trend"])
+            st_prv = int(df.loc[i - 1, "st_trend"])
+            flip_bull = st_prv == -1 and st_now == 1
+            flip_bear = st_prv == 1  and st_now == -1
+
+            if flip_bull and bull and vol_ok:
+                sig = "buy"
+            elif not long_only and flip_bear and not bull and vol_ok:
+                sig = "sell"
+
+        # --- MACD Score Rider: MACD histogram crossover + piyasa skoru ---
+        elif entry_mode == "macd_score_rider":
+            mh_now  = float(row["macd_h"])
+            mh_prv  = float(df.loc[i - 1, "macd_h"])
+            rsi_v   = float(row["rsi_ind"])
+            ef_v    = float(row["ef"])    # EMA21
+            es_v    = float(row["es"])    # EMA55
+            et_v    = float(row["et"])    # EMA200
+            p_prev  = float(df.loc[i - 1, "close"])
+            p_prev2 = float(df.loc[i - 2, "close"]) if i >= 2 else p_prev
+
+            macd_cross_up = mh_now > 0 and mh_prv <= 0
+            score = _market_score(price, ef_v, es_v, et_v, adx, rsi_v, p_prev, p_prev2)
+
+            if macd_cross_up and vol_ok and score >= score_min:
+                sig = "buy"
+                _trade_risk = risk_high if score >= score_high else risk_low
+
         if sig is None:
             continue
 
-        sl     = price - sl_mult * atr if sig == "buy" else price + sl_mult * atr
-        cap_tp = price + cap_mult * atr if sig == "buy" else price - cap_mult * atr
-        sl_dist = abs(price - sl)
-        qty    = (balance * risk / sl_dist) if sl_dist > 0 else 0
+        # Supertrend: SL = destek çizgisi (ATR SL değil)
+        if entry_mode == "supertrend":
+            sup = float(row["st_support"])
+            sl      = sup if sig == "buy" else (2 * price - sup)  # sell için simetrik
+            cap_tp  = price + cap_mult * atr if sig == "buy" else price - cap_mult * atr
+        else:
+            sl      = price - sl_mult * atr if sig == "buy" else price + sl_mult * atr
+            cap_tp  = price + cap_mult * atr if sig == "buy" else price - cap_mult * atr
+
+        sl_dist = max(abs(price - sl), price * 0.001)  # min %0.1 koruma
+        if entry_mode == "macd_score_rider":
+            qty = (balance * _trade_risk / sl_dist) if sl_dist > 0 else 0
+        else:
+            qty = (balance * risk / sl_dist) if sl_dist > 0 else 0
 
         if qty <= 0:
             continue
@@ -451,8 +595,8 @@ def main():
     parser.add_argument("--balance",      type=float, default=10_000.0)
     parser.add_argument("--long-only",    action="store_true")
     parser.add_argument("--plot",         action="store_true")
-    parser.add_argument("--entry-mode",   default="ma_cross",
-                        choices=["ma_cross", "rsi_pullback", "stochrsi", "quad_ma", "breakout"])
+    parser.add_argument("--entry-mode",   default="supertrend",
+                        choices=["ma_cross", "rsi_pullback", "stochrsi", "quad_ma", "breakout", "macd_score_rider", "supertrend"])
     parser.add_argument("--no-cross-exit", action="store_true",
                         help="MA tersine dönüşünde çıkışı devre dışı bırak")
     parser.add_argument("--compare",      action="store_true",
@@ -479,23 +623,36 @@ def main():
     if args.compare:
         # Her mod için optimize edilmiş parametreler
         mode_params = {
-            "ma_cross"   : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
-            "quad_ma"    : dict(fast=15, slow=50, sl_mult=1.2, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
-            "breakout"   : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=8.0, trail_be=1.5, trail_act=2.5, trail_dist=2.0),
-            "rsi_pullback": dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
-            "stochrsi"   : dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5, trail_be=2.0, trail_act=3.0, trail_dist=1.5),
+            "supertrend"      : dict(fast=21, slow=55, sl_mult=1.5, cap_mult=15.0,
+                                     trail_be=2.0, trail_act=4.0, trail_dist=2.0,
+                                     exit_on_cross=False, st_multiplier=7.0, st_atr_period=14),
+            "macd_score_rider": dict(fast=21, slow=55, sl_mult=2.0, cap_mult=20.0,
+                                     trail_be=2.5, trail_act=4.5, trail_dist=3.0,
+                                     exit_on_cross=False, risk_high=0.05, risk_low=0.01,
+                                     score_min=6, score_high=9),
+            "ma_cross"        : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=5.5,
+                                     trail_be=2.0, trail_act=3.0, trail_dist=1.5, exit_on_cross=True),
+            "quad_ma"         : dict(fast=15, slow=50, sl_mult=1.2, cap_mult=5.5,
+                                     trail_be=2.0, trail_act=3.0, trail_dist=1.5, exit_on_cross=True),
+            "breakout"        : dict(fast=21, slow=55, sl_mult=1.2, cap_mult=8.0,
+                                     trail_be=1.5, trail_act=2.5, trail_dist=2.0, exit_on_cross=True),
+            "rsi_pullback"    : dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5,
+                                     trail_be=2.0, trail_act=3.0, trail_dist=1.5, exit_on_cross=True),
+            "stochrsi"        : dict(fast=21, slow=55, sl_mult=1.5, cap_mult=5.5,
+                                     trail_be=2.0, trail_act=3.0, trail_dist=1.5, exit_on_cross=True),
         }
-        print(f"\n{'Mod':<15} {'Getiri':>8} {'İşlem':>6} {'KazO%':>7} {'PF':>6}  {'Ort.Kazan':>10}  {'Ort.Kayıp':>10}")
-        print("─" * 68)
-        for mode in ["ma_cross", "quad_ma", "breakout", "rsi_pullback", "stochrsi"]:
-            kw = mode_params.get(mode, {})
+        print(f"\n{'Mod':<20} {'Getiri':>8} {'İşlem':>6} {'KazO%':>7} {'PF':>6}  {'Ort.Kazan':>10}  {'Ort.Kayıp':>10}")
+        print("─" * 75)
+        for mode in ["supertrend", "macd_score_rider", "ma_cross", "quad_ma", "breakout", "rsi_pullback", "stochrsi"]:
+            kw = dict(mode_params.get(mode, {}))
+            ec = kw.pop("exit_on_cross", use_cross)
             r = run_backtest(df, initial_balance=args.balance,
                              long_only=args.long_only, entry_mode=mode,
-                             exit_on_cross=use_cross, **kw)
-            print(f"{mode:<15} {r['total_return_pct']:>+7.2f}% {r['n_trades']:>6} "
+                             exit_on_cross=ec, **kw)
+            print(f"{mode:<20} {r['total_return_pct']:>+7.2f}% {r['n_trades']:>6} "
                   f"{r['win_rate_pct']:>6.1f}% {r['profit_factor']:>6.2f}  "
                   f"{r['avg_win']:>+10.2f}  {r['avg_loss']:>+10.2f}")
-        print(f"{'Al-Tut':<15} {bh:>+7.2f}%")
+        print(f"{'Al-Tut':<20} {bh:>+7.2f}%")
     else:
         result = run_backtest(df, initial_balance=args.balance,
                               long_only=args.long_only, entry_mode=args.entry_mode,

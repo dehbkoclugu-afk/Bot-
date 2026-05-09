@@ -35,7 +35,8 @@ from risk_manager import (
 from config import (
     SYMBOL, TIMEFRAME, MA_FASTEST, MA_FAST, MA_SLOW, MA_TREND, ENTRY_MODE, EXIT_ON_CROSS,
     ATR_SL_MULT, ATR_CAP_MULT, ATR_TRAIL_BREAKEVEN, ATR_TRAIL_ACTIVATE, ATR_TRAIL_DIST,
-    RISK_PER_TRADE, POLL_INTERVAL_SEC, CANDLES_REQUIRED, LOG_FILE,
+    RISK_PER_TRADE, RISK_HIGH, RISK_LOW,
+    POLL_INTERVAL_SEC, CANDLES_REQUIRED, LOG_FILE,
 )
 
 # ---------------------------------------------------------------------------
@@ -259,13 +260,29 @@ class TradingBot:
         if self.position:
             pos = self.position
 
-            new_sl, new_ext = update_trailing_stop(
-                pos["side"], pos["entry"], pos["atr_e"],
-                current_price, pos["sl"], pos["extreme"],
-            )
-            pos["sl"]      = new_sl
-            pos["extreme"] = new_ext
-            self.position  = pos
+            # Supertrend modunda SL = destek çizgisi (dinamik)
+            if ENTRY_MODE == "supertrend":
+                st_sup = float(df_ind["st_support"].iloc[-2])
+                if pos["side"] == "buy":
+                    pos["sl"] = max(pos["sl"], st_sup)
+                else:
+                    pos["sl"] = min(pos["sl"], st_sup)
+                # Supertrend flip kontrolü
+                st_now = int(df_ind["st_trend"].iloc[-2])
+                st_prv = int(df_ind["st_trend"].iloc[-3])
+                flip_bear = st_prv == 1 and st_now == -1
+                flip_bull = st_prv == -1 and st_now == 1
+                if (pos["side"] == "buy" and flip_bear) or (pos["side"] == "sell" and flip_bull):
+                    self._close_position(current_price, "st_flip")
+                    return
+            else:
+                new_sl, new_ext = update_trailing_stop(
+                    pos["side"], pos["entry"], pos["atr_e"],
+                    current_price, pos["sl"], pos["extreme"],
+                )
+                pos["sl"]      = new_sl
+                pos["extreme"] = new_ext
+            self.position = pos
 
             result = check_exit(
                 pos["side"], current_price, pos["sl"], pos["cap_tp"]
@@ -330,8 +347,9 @@ class TradingBot:
         sl     = levels["stop_loss"]
         cap_tp = levels["cap_tp"]
 
-        balance = 10_000.0 if self.dry_run else ex.fetch_balance()
-        qty     = calculate_position_size(balance, price, sl)
+        balance    = 10_000.0 if self.dry_run else ex.fetch_balance()
+        trade_risk = sig.get("trade_risk", RISK_PER_TRADE)
+        qty        = calculate_position_size(balance, price, sl, trade_risk=trade_risk)
 
         if qty <= 0:
             log.warning("Pozisyon boyutu sıfır — sinyal atlanıyor")

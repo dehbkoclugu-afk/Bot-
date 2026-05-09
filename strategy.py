@@ -26,6 +26,9 @@ from config import (
     SRSI_PERIOD, SRSI_K_SMOOTH, SRSI_D_SMOOTH,
     SRSI_OVERSOLD, SRSI_OVERBOUGHT,
     VOLUME_MA_PERIOD, VOLUME_MIN_MULT,
+    MACD_FAST, MACD_SLOW, MACD_SIGNAL,
+    SCORE_MIN, SCORE_HIGH, RISK_HIGH, RISK_LOW,
+    ST_ATR_PERIOD, ST_MULTIPLIER,
     ENTRY_MODE,
 )
 
@@ -87,6 +90,59 @@ def _stoch_rsi(
     return k, d
 
 
+def _macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD çizgisi, sinyal çizgisi ve histogram döndürür."""
+    line = _ema(series, fast) - _ema(series, slow)
+    sig  = _ema(line, signal)
+    hist = line - sig
+    return line, sig, hist
+
+
+def _supertrend(
+    df: pd.DataFrame,
+    atr_period: int = 14,
+    multiplier: float = 7.0,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Supertrend: trend (1=boğa/-1=ayı) ve destek/direnç çizgisi döndürür.
+    Destek çizgisi long pozisyon için dinamik SL olarak kullanılır.
+    """
+    atr   = _atr(df, atr_period)
+    hl2   = (df["high"] + df["low"]) / 2
+    close = df["close"].values
+    upper = (hl2 + multiplier * atr).values
+    lower = (hl2 - multiplier * atr).values
+    n = len(df)
+
+    fu = upper.copy()
+    fl = lower.copy()
+    trend   = [1] * n
+    support = [0.0] * n
+
+    for i in range(1, n):
+        fu[i] = upper[i] if upper[i] < fu[i-1] or close[i-1] > fu[i-1] else fu[i-1]
+        fl[i] = lower[i] if lower[i] > fl[i-1] or close[i-1] < fl[i-1] else fl[i-1]
+
+        if trend[i-1] == -1 and close[i] > fu[i-1]:
+            trend[i] = 1
+        elif trend[i-1] == 1 and close[i] < fl[i-1]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i-1]
+
+        support[i] = fl[i] if trend[i] == 1 else fu[i]
+
+    return (
+        pd.Series(trend,   index=df.index, name="st_trend"),
+        pd.Series(support, index=df.index, name="st_support"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gösterge ekleme
 # ---------------------------------------------------------------------------
@@ -110,6 +166,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["srsi_k"], df["srsi_d"] = _stoch_rsi(
         df["close"], SRSI_PERIOD, SRSI_K_SMOOTH, SRSI_D_SMOOTH
     )
+
+    # MACD
+    df["macd_line"], df["macd_signal"], df["macd_hist"] = _macd(
+        df["close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL
+    )
+
+    # Supertrend
+    df["st_trend"], df["st_support"] = _supertrend(df, ST_ATR_PERIOD, ST_MULTIPLIER)
 
     # EMA hizalama (sürekli durum: sadece kesişme anı değil)
     df["ema_bull"] = df["ma_fast"] > df["ma_slow"]
@@ -160,7 +224,12 @@ def get_signal(df: pd.DataFrame, state: dict | None = None) -> dict:
         "adx"        : float(row["adx"]),
         "srsi_k"     : float(row["srsi_k"]),
         "srsi_d"     : float(row["srsi_d"]),
+        "macd_hist"  : float(row["macd_hist"]),
+        "st_trend"   : int(row["st_trend"]),
+        "st_support" : float(row["st_support"]),
         "bull"       : bool(row["close"] > row["ma_trend"]),
+        "score"      : 0,
+        "trade_risk" : RISK_LOW,
     }
 
     price      = base["price"]
@@ -176,7 +245,45 @@ def get_signal(df: pd.DataFrame, state: dict | None = None) -> dict:
 
     mode = ENTRY_MODE if state is not None else "ma_cross"
 
-    if mode == "quad_ma":
+    if mode == "supertrend":
+        st_now = int(row["st_trend"])
+        st_prv = int(prv["st_trend"])
+        bull_flip = st_prv == -1 and st_now == 1   # Supertrend ayıdan boğaya döndü
+        bear_flip = st_prv == 1  and st_now == -1
+
+        if bull_flip and bull and vol_ok:
+            base["signal"] = "buy"
+        elif bear_flip and not bull and vol_ok:
+            base["signal"] = "sell"
+
+    elif mode == "macd_score_rider":
+        mh_now  = float(row["macd_hist"])
+        mh_prv  = float(prv["macd_hist"])
+        rsi_v   = float(row["rsi"])
+        ef_v    = float(row["ma_fast"])    # EMA21
+        es_v    = float(row["ma_slow"])    # EMA55
+        et_v    = float(row["ma_trend"])   # EMA200
+        p_prev  = float(prv["close"])
+        p_prev2 = float(df.iloc[-4]["close"]) if len(df) >= 4 else p_prev
+
+        macd_cross_up = mh_now > 0 and mh_prv <= 0
+
+        score = 0
+        if price > et_v:                    score += 2
+        if ef_v > es_v:                     score += 2
+        if adx > 25:                        score += 2
+        elif adx > ADX_THRESHOLD:           score += 1
+        if 50 <= rsi_v <= 70:               score += 2
+        elif 45 <= rsi_v <= 72:             score += 1
+        if price > p_prev:                  score += 1
+        if price > p_prev2:                 score += 1
+
+        if macd_cross_up and vol_ok and score >= SCORE_MIN:
+            base["signal"]     = "buy"
+            base["score"]      = score
+            base["trade_risk"] = RISK_HIGH if score >= SCORE_HIGH else RISK_LOW
+
+    elif mode == "quad_ma":
         e1     = float(row["ma_fastest"])   # EMA5
         e1_prv = float(prv["ma_fastest"])
         ef     = float(row["ma_fast"])      # EMA15
